@@ -1,7 +1,7 @@
 //! The last step for a window whose surface shows its alpha: the client-side
 //! chrome's rounded corners.
 //!
-//! A Mac window's content is opaque whatever alpha its layers leave, so every
+//! An opaque Mac window ignores the alpha its layers leave, so every
 //! row below the chrome is given full alpha, and the bottom corners are then
 //! scaled by how much of each pixel lies inside the rounding - the same
 //! coverage `chrome::corners` gives the store on the CPU. The top corners come
@@ -41,15 +41,20 @@ pub(super) struct Shape {
 
 impl Shape {
     /// `window`'s shape at `width` by `height`, from its chrome as last
-    /// painted. A window with none yet is sealed whole and square.
+    /// painted. A window with none yet is sealed whole and square, and one
+    /// that answered no to `-isOpaque` keeps its own alpha throughout.
     pub(super) fn of(window: sdl3::Window, width: u32, height: u32) -> Self {
         let chrome = appkit::decor::pixels(window);
+        let top = match appkit::window::is_translucent(window) {
+            true => height,
+            false => chrome
+                .as_ref()
+                .map_or(0, |chrome| chrome.height.min(height)),
+        };
         Self {
             width,
             height,
-            top: chrome
-                .as_ref()
-                .map_or(0, |chrome| chrome.height.min(height)),
+            top,
             radius: chrome.as_ref().map_or(0.0, |chrome| chrome.radius.max(0.0)),
         }
     }

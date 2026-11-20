@@ -4032,8 +4032,10 @@ fn present_dirty() {
                     std::slice::from_raw_parts_mut(surface.pixels, surface.pitch as usize * rows)
                 };
                 let pitch = surface.pitch as usize;
-                let chrome_rows = chrome.as_ref().map_or(0, |chrome| chrome.height as usize);
-                make_opaque(pixels, columns, rows, pitch, chrome_rows);
+                if !crate::window::is_translucent(window) {
+                    let chrome_rows = chrome.as_ref().map_or(0, |chrome| chrome.height as usize);
+                    make_opaque(pixels, columns, rows, pitch, chrome_rows);
+                }
                 if let Some(chrome) = chrome.as_ref().filter(|chrome| chrome.radius > 0.0) {
                     chrome::corners::clip(pixels, columns, rows, pitch, chrome.radius, false, true);
                 }
@@ -4045,8 +4047,8 @@ fn present_dirty() {
 
 /// Give every pixel from row `from` down full alpha.
 ///
-/// A window with room for rounded corners shows its alpha, which a Mac's
-/// window content never does: what no view drew is transparent in the
+/// A window with room for rounded corners shows its alpha, which an opaque
+/// Mac window's content never does: what no view drew is transparent in the
 /// store, and there it would be a hole through to the desktop. Premultiplied
 /// pixels given full alpha are as if drawn over black, which is what an
 /// opaque window shows for them too.

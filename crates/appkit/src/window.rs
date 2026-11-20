@@ -106,6 +106,11 @@ pub struct Window {
     frame_view: Id,
     /// `-titlebarAccessoryViewControllers`, an owned mutable array or null.
     accessories: Id,
+    /// What the window answered to `-backgroundColor`, retained, or null until
+    /// it was first ordered front.
+    answered_background: Id,
+    /// Nonzero when the window answered no to `-isOpaque`.
+    translucent: usize,
 }
 
 pub const INSTANCE_SIZE: usize = size_of::<Window>();
@@ -569,7 +574,8 @@ fn rehome_popup_descendants(old: sdl3::Window, replacement: sdl3::Window) {
         } else {
             Api::Undecided
         };
-        let flags = (creation_flags(window_of(object).style_mask, api)
+        let translucent = window_of(object).translucent != 0;
+        let flags = (creation_flags(window_of(object).style_mask, api, translucent)
             & !sdl3::video::flags::BORDERLESS)
             | popup;
         let Some(new) =
@@ -689,6 +695,13 @@ pub fn window_for(sdl: sdl3::Window) -> Id {
         .iter()
         .find(|(w, _)| *w == sdl as usize)
         .map_or(std::ptr::null_mut(), |(_, object)| *object as Id)
+}
+
+/// Whether an SDL window's `NSWindow` answered no to `-isOpaque`, so what no
+/// view drew shows what is behind it.
+pub fn is_translucent(sdl: sdl3::Window) -> bool {
+    let object = window_for(sdl);
+    !object.is_null() && window_of(object).translucent != 0
 }
 
 /// Every live SDL window, for a change that applies to all of them.
@@ -1496,7 +1509,7 @@ unsafe extern "C" fn init_with_content_rect(
     let rect = frame_for_content(rect, inset);
     window.requested = rect;
 
-    let flags = creation_flags(style_mask, Api::Undecided);
+    let flags = creation_flags(style_mask, Api::Undecided, false);
     let (x, y, width, height) = crate::geometry::rect_to_sdl(rect);
     let (width, height) = match forced_size() {
         // A guest which sizes its first window to a fraction of the screen is
@@ -1628,7 +1641,7 @@ pub unsafe fn init_with_content_rect_for_tests(window: Id, rect: NSRect) -> bool
 /// will not convert - `SDL_GL_CreateContext` refuses a non-OpenGL window
 /// outright - so a guest which asks for an `NSOpenGLContext` has its window
 /// rebuilt as an OpenGL one; see [`rebuild_for_opengl`].
-fn creation_flags(style_mask: usize, api: Api) -> u64 {
+fn creation_flags(style_mask: usize, api: Api, translucent: bool) -> u64 {
     let mut flags = sdl3::video::flags::HIDDEN | sdl3::video::flags::HIGH_PIXEL_DENSITY;
     if matches!(api, Api::OpenGl) {
         flags |= sdl3::video::flags::OPENGL;
@@ -1650,7 +1663,8 @@ fn creation_flags(style_mask: usize, api: Api) -> u64 {
     // and its GL and Vulkan visuals would pass the guest's alpha through.
     // The virtual desktop composites with alpha itself, whatever shows it.
     let alpha = sdl3::video::is_wayland() || sdl3::desktop::active();
-    if style_mask & style::TITLED != 0 && draws_own_titlebar() && alpha {
+    let rounded_chrome = style_mask & style::TITLED != 0 && draws_own_titlebar();
+    if alpha && (rounded_chrome || translucent) {
         flags |= sdl3::video::flags::TRANSPARENT;
     }
     flags
@@ -1742,7 +1756,7 @@ fn remake(receiver: Id, api: Api, want: Presentation) -> bool {
     let shown = window.shown != 0;
     let (x, y, _, _) = crate::geometry::rect_to_sdl(window.requested);
 
-    let flags = creation_flags(window.style_mask, api);
+    let flags = creation_flags(window.style_mask, api, window.translucent != 0);
     let new = match want.popup_flags() {
         Some(popup) => {
             let parent = popup_parent(receiver);
@@ -2444,6 +2458,16 @@ fn order_front(receiver: Id, make_key: bool) {
         "{receiver:p} ordered front as {want:?}: style {:#x} level {}",
         window.style_mask, window.level,
     );
+    ask_appearance(receiver);
+    let window = window_of(receiver);
+    let api = match draws_with_opengl(window.sdl) {
+        true => Api::OpenGl,
+        false => Api::Undecided,
+    };
+    let wrong_alpha = (creation_flags(window.style_mask, api, window.translucent != 0)
+        ^ sdl3::video::window_flags(window.sdl))
+        & sdl3::video::flags::TRANSPARENT
+        != 0;
     // What a window is, is decided here and not at creation: a toolkit gives a
     // window its style mask and its level after making it, and reuses one
     // window as a dialog, then as a tooltip. A popup's parent has to be on the
@@ -2451,11 +2475,9 @@ fn order_front(receiver: Id, make_key: bool) {
     if want != presentation_of_sdl(window.sdl)
         && !(want != Presentation::Toplevel && popup_parent(receiver).is_null())
     {
-        let api = match draws_with_opengl(window.sdl) {
-            true => Api::OpenGl,
-            false => Api::Undecided,
-        };
         remake(receiver, api, want);
+    } else if wrong_alpha {
+        remake(receiver, api, presentation_of_sdl(window.sdl));
     }
     let window = window_of(receiver);
     let sdl = window.sdl;
@@ -2562,6 +2584,10 @@ pub(crate) unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
     objc::arc::release(content);
     objc::arc::release(std::mem::replace(
         &mut window.background,
+        std::ptr::null_mut(),
+    ));
+    objc::arc::release(std::mem::replace(
+        &mut window.answered_background,
         std::ptr::null_mut(),
     ));
     objc::arc::release(std::mem::replace(
@@ -2932,13 +2958,42 @@ unsafe extern "C" fn set_background_color(receiver: Id, _sel: Sel, color: Id) {
     let window = window_of(receiver);
     objc::arc::release(window.background);
     window.background = objc::arc::retain(color);
+    if window.shown != 0 {
+        ask_appearance(receiver);
+    }
     crate::backing::window_background_changed(receiver);
+}
+
+/// Ask the window, so a subclass's override decides, what AppKit's compositor
+/// would: its background and whether it is opaque. The answers are kept
+/// because the window is composited off the main thread, where guest code
+/// cannot be called.
+///
+/// FIXME (ACCURACY): an override whose answer changes is only heard again
+/// when the window is ordered front or its background is set.
+fn ask_appearance(receiver: Id) {
+    let translucent = !crate::event::answers(receiver, "isOpaque");
+    // SAFETY: `-backgroundColor` is `id (id, SEL)`.
+    let color = unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc::msg::entry());
+        f(receiver, objc::sel::get("backgroundColor"))
+    };
+    let window = window_of(receiver);
+    window.translucent = translucent as usize;
+    objc::arc::release(std::mem::replace(
+        &mut window.answered_background,
+        objc::arc::retain(color),
+    ));
 }
 
 /// The window's `backgroundColor` as straight RGBA: `windowBackgroundColor`
 /// in the current appearance when the program never set one.
 fn background_rgba(window: Id) -> (f64, f64, f64, f64) {
-    let color = window_of(window).background;
+    let window = window_of(window);
+    let color = match window.answered_background.is_null() {
+        true => window.background,
+        false => window.answered_background,
+    };
     match color.is_null() {
         true => crate::color::named_components(WINDOW_BACKGROUND)
             .expect("windowBackgroundColor is a named colour"),
@@ -4597,6 +4652,45 @@ mod tests {
     }
 
     #[test]
+    fn a_window_is_composited_with_what_its_overrides_answer() {
+        crate::bootstrap();
+        let base = objc::class::lookup(c"NSWindow").unwrap();
+        let subclass = objc::class::allocate_pair(Some(base), c"ClearOverrideWindow", 0).unwrap();
+        unsafe extern "C" fn not_opaque(_receiver: Id, _sel: Sel) -> u8 {
+            0
+        }
+        unsafe extern "C" fn clear(_receiver: Id, _sel: Sel) -> Id {
+            crate::color::named_color("clearColor").expect("clearColor")
+        }
+        subclass.add_method(
+            objc::sel::get("isOpaque"),
+            not_opaque as objc::class::Imp,
+            c"c16@0:8",
+        );
+        subclass.add_method(
+            objc::sel::get("backgroundColor"),
+            clear as objc::class::Imp,
+            c"@16@0:8",
+        );
+        objc::class::register_pair(subclass);
+
+        let window = objc::object::create_instance(subclass, 0);
+        ask_appearance(window);
+        assert_eq!(window_of(window).translucent, 1);
+        assert_eq!(background_rgba(window).3, 0.0);
+        objc::arc::release(window);
+
+        let plain = objc::object::create_instance(base, 0);
+        ask_appearance(plain);
+        assert_eq!(window_of(plain).translucent, 0);
+        assert_eq!(
+            Some(background_rgba(plain)),
+            crate::color::named_components(WINDOW_BACKGROUND)
+        );
+        objc::arc::release(plain);
+    }
+
+    #[test]
     fn perform_close_respects_style_and_delegate_and_dispatches_close() {
         crate::bootstrap();
         let base = objc::class::lookup(c"NSWindow").unwrap();
@@ -4711,14 +4805,14 @@ mod tests {
         // The default. A window with neither flag has no `EGLSurface`, so
         // `SDL_Vulkan_CreateSurface` can convert it and Metal presentation
         // needs nothing known in advance about the guest.
-        let plain = creation_flags(style::TITLED | style::RESIZABLE, Api::Undecided);
+        let plain = creation_flags(style::TITLED | style::RESIZABLE, Api::Undecided, false);
         assert_eq!(plain & flags::OPENGL, 0);
         assert_eq!(plain & flags::VULKAN, 0);
         assert_eq!(plain & flags::METAL != 0, cfg!(target_os = "macos"));
 
         // A guest that asks for an `NSOpenGLContext` gets the window rebuilt
         // as this, because SDL will not convert to OpenGL.
-        let gl = creation_flags(style::TITLED | style::RESIZABLE, Api::OpenGl);
+        let gl = creation_flags(style::TITLED | style::RESIZABLE, Api::OpenGl, false);
         assert_ne!(gl & flags::OPENGL, 0);
         assert_eq!(gl & flags::VULKAN, 0);
         assert_eq!(gl & flags::METAL, 0);
@@ -4727,7 +4821,7 @@ mod tests {
         // whole point is that at most one driver owns the surface.
         for style in [0, style::TITLED, style::RESIZABLE, style::CLOSABLE] {
             for api in [Api::Undecided, Api::OpenGl] {
-                let flags = creation_flags(style, api);
+                let flags = creation_flags(style, api, false);
                 assert!(
                     flags & flags::OPENGL == 0 || flags & flags::VULKAN == 0,
                     "a window was asked for both graphics APIs"
@@ -4737,14 +4831,17 @@ mod tests {
 
         // The rest of the mapping is unchanged by any of it.
         let api = Api::Undecided;
-        assert_ne!(creation_flags(style::RESIZABLE, api) & flags::RESIZABLE, 0);
+        assert_ne!(
+            creation_flags(style::RESIZABLE, api, false) & flags::RESIZABLE,
+            0
+        );
         assert_eq!(
-            creation_flags(style::TITLED, api) & flags::BORDERLESS != 0,
+            creation_flags(style::TITLED, api, false) & flags::BORDERLESS != 0,
             draws_own_titlebar(),
             "a titled window is bordered exactly when the host draws its titlebar"
         );
-        assert_ne!(creation_flags(0, api) & flags::BORDERLESS, 0);
-        assert_ne!(creation_flags(0, api) & flags::HIDDEN, 0);
+        assert_ne!(creation_flags(0, api, false) & flags::BORDERLESS, 0);
+        assert_ne!(creation_flags(0, api, false) & flags::HIDDEN, 0);
     }
 
     /// A window becomes an OpenGL window only when one is asked for, and
